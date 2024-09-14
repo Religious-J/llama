@@ -129,13 +129,15 @@ class Llama:
     @torch.inference_mode()
     def generate(
         self,
-        prompt_tokens: List[List[int]],
-        max_gen_len: int,
+        prompt_tokens: List[List[int]],    # prompt tokens
+        max_gen_len: int,                  # generate max len
         temperature: float = 0.6,
         top_p: float = 0.9,
         logprobs: bool = False,
         echo: bool = False,
-    ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
+    ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:   # Optional[List[List[float]]]] 相当于 Union[List[List[float]], None]
+                                                                # 即是一个二维浮点数列表，也可以是 None
+        # Tuple不可变性
         """
         Generate text sequences based on provided prompts using the language generation model.
 
@@ -155,27 +157,74 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
+        
+        """
+        根据提供的提示生成文本序列，使用语言生成模型
+        
+        参数：
+            prompt_tokens (List[List[int]]): 经过标记化的提示列表，每个提示用一个整数列表表示。
+            max_gen_len (int): 生成文本序列的最大长度。
+            temperature (float, 可选): 控制采样随机性的温度值。默认值为 0.6。
+            top_p (float, 可选): 用于核采样的 top-p 概率阈值。默认值为 0.9。
+            logprobs (bool, 可选): 指示是否计算 token 的对数概率的标志。默认值为 False。
+            echo (bool, 可选): 指示是否在生成的输出中包含 prompt token 的标志。默认值为 False。
+        
+        返回值：
+            Tuple[List[List[int]], Optional[List[List[float]]]]: 返回一个元组，包含生成的 token 序列，如果 logprobs 为 True, 还包含相应的 token 对数概率。
+
+        注意事项：
+            此方法使用提供的 prompts 作为生成文本的基础。它采用核采样来生成具有可控随机性的文本。
+            如果 logprobs 为 True, 则会计算每个生成 token 的对数概率。
+        """
+        
         params = self.model.params
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
         min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)                 # max
         assert max_prompt_len <= params.max_seq_len
-        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)   # 最终要生成字总长度
+        
+        """
+        if:
+            prompt_tokens = [
+                [1, 2, 3],      # prompt_token 1
+                [4, 5],         # prompt_token 2
+                [6, 7, 8, 9]    # prompt_token 3
+                ]
+        
+        if:
+            pad_id = 0
+            bsz = len(prompt_tokens)  # 批次大小为 3
+            max_length = max(len(t) for t in prompt_tokens)  # 最大长度为 4
+        
+        初始的 tokens 张量:
+            tensor([[0, 0, 0, 0],
+                    [0, 0, 0, 0],
+                    [0, 0, 0, 0]])
+        
+        => 填充 tokens 张量
+            tensor([[1, 2, 3, 0],
+                    [4, 5, 0, 0],
+                    [6, 7, 8, 9]])
+        """
 
-        pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
-        for k, t in enumerate(prompt_tokens):
+        pad_id = self.tokenizer.pad_id                                                  # 填充字，在 tokenizer 中定义的填充字
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")  # 生成一个 shape 为 (prompt_tokens, total_len) 初始字符为 pad_id 的 tokens
+        # => 填充 tokens 张量
+        for k, t in enumerate(prompt_tokens):   # enumerate is useful for obtaining an indexed list （因为要 index
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            # tokens[k, : len(t)]: 这一部分表示选择 tokens 张量的第 k 行，从第 0 列到第 len(t) - 1 列
         if logprobs:
+            # 初始化对数概率张量
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
-
-        prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
-        input_text_mask = tokens != pad_id
-        if min_prompt_len == total_len:
-            logits = self.model.forward(tokens, prev_pos)
+ 
+        prev_pos = 0                                               # 初始位置为0
+        eos_reached = torch.tensor([False] * bsz, device="cuda")   # 记录是否到达结束标记
+        input_text_mask = tokens != pad_id                         # mask 标记那些不是 padding 的地方
+        if min_prompt_len == total_len:                            # 如果提示长度等于总长度
+            logits = self.model.forward(tokens, prev_pos)          # 计算对数概率
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
@@ -184,33 +233,100 @@ class Llama:
             )
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            # 初始时加载 prompt 部分进行预测第一个生成的 token   
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)   # 以每个句子中的[prev_pos:cur_pos]部分作为输入去推理
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
+                next_token = sample_top_p(probs, top_p)                          # 核采样
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
-            next_token = next_token.reshape(-1)
+            next_token = next_token.reshape(-1)                                  # 再将生成的 next_token 填入 cur_pos 位置
             # only replace token if prompt has already been generated
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
             tokens[:, cur_pos] = next_token
-            if logprobs:
-                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
+            if logprobs:                                                           # 计算对数概率
+                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(  # 会把当前输出的序列logits，与原始提示中的序列右移一位之后
                     input=logits.transpose(1, 2),
                     target=tokens[:, prev_pos + 1 : cur_pos + 1],
                     reduction="none",
-                    ignore_index=pad_id,
+                    ignore_index=pad_id,                                          # ignore_index 参数的作用是忽略 target 中为 pad_id 所对应的 logits 分量
                 )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                next_token == self.tokenizer.eos_id
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (                     # 检查是否到达结束标记
+                next_token == self.tokenizer.eos_id                               # input_text_mask 是一个布尔张量，指示哪些位置是有效的输入标记，哪些是填充标记（pad_id）
             )
             prev_pos = cur_pos
-            if all(eos_reached):
+            if all(eos_reached):                                                  # 如果所有提示都到达结束标记，退出循环
                 break
 
+        """
+        tokens = [
+            [1, 2, 3, 0],
+            [4, 5, 0, 0],
+            [6, 7, 8, 9]
+        ]
+        
+        prompt_tokens = [
+            [1, 2],  # prompt_token 1
+            [4],     # prompt_token 2
+            [6, 7]   # prompt_token 3
+        ]
+        
+        token_logprobs = [
+            [0.1, 0.2, 0.3, 0.0],  # 对应 tokens[0]
+            [0.4, 0.5, 0.0, 0.0],  # 对应 tokens[1]
+            [0.6, 0.7, 0.8, 0.9]   # 对应 tokens[2]
+        ]
+        
+        logprobs = True
+        max_gen_len = 2
+        echo = False
+        self.tokenizer.eos_id = 0
+        
+    迭代处理每个提示的生成标记:
+        第一轮 (i=0)
+            toks = [1, 2, 3, 0]
+            start = 2 , 因为 len(prompt_tokens[0]) = 2
+            截取后, toks = [3, 0]（从索引 2 开始）
+        第二轮 (i=1)
+            toks = [4, 5, 0, 0]
+            start = 1 , 因为 len(prompt_tokens[1]) = 1
+            截取后, toks = [5, 0]（从索引 1 开始）
+        第三轮 (i=2)
+            toks = [6, 7, 8, 9]
+            start = 2 , 因为 len(prompt_tokens[2]) = 2
+            截取后, toks = [8, 9]（从索引 2 开始）
+        
+    处理对数概率:
+        第一轮 (i=0)
+            对应的 probs = [0.3, 0.0]（截取后）
+        第二轮 (i=1)
+            对应的 probs = [0.5, 0.0]（截取后）
+        第三轮 (i=2)
+            对应的 probs = [0.8, 0.9]（截取后）            
+        
+    检查结束标记并截取:
+        第一轮 (i=0)
+            toks = [3, 0] 包含结束标记 0
+            截取后, toks = [3]
+            对应 probs 变为 [0.3]
+        第二轮 (i=1)
+            toks = [5, 0] 包含结束标记 0
+            截取后, toks = [5]
+            对应 probs 变为 [0.5]
+        第三轮 (i=2)
+            toks = [8, 9] 不包含结束标记，保持不变
+            对应 probs = [0.8, 0.9]
+    
+    最终结果：
+        out_tokens = [[3], [5], [8, 9]]
+        out_logprobs = [[0.3], [0.5], [0.8, 0.9]]
+        
+    out_tokens 中的每个元素都是经过处理的生成序列，仅包含有效内容。
+    out_logprobs 中的对数概率对应于生成的标记，可以用于分析生成的质量。
+        """
         if logprobs:
             token_logprobs = token_logprobs.tolist()
         out_tokens, out_logprobs = [], []
