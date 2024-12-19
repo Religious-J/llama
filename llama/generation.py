@@ -165,7 +165,7 @@ class Llama:
             prompt_tokens (List[List[int]]): 经过标记化的提示列表，每个提示用一个整数列表表示。
             max_gen_len (int): 生成文本序列的最大长度。
             temperature (float, 可选): 控制采样随机性的温度值。默认值为 0.6。
-            top_p (float, 可选): 用于核采样的 top-p 概率阈值。默认值为 0.9。
+            top_p (float, 可选): 用于 top-p 概率阈值。默认值为 0.9。
             logprobs (bool, 可选): 指示是否计算 token 的对数概率的标志。默认值为 False。
             echo (bool, 可选): 指示是否在生成的输出中包含 prompt token 的标志。默认值为 False。
         
@@ -237,7 +237,7 @@ class Llama:
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)   # 以每个句子中的[prev_pos:cur_pos]部分作为输入去推理
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)                          # 核采样
+                next_token = sample_top_p(probs, top_p)                          # topK_P
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 

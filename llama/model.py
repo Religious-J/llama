@@ -198,17 +198,22 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        # parallel 处理相关的切分
         model_parallel_size = fs_init.get_model_parallel_world_size()
+        # tp_size 切分 ==> local
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        # same as LMK Q_PER_KV
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
+        # A: [dim, n_heads * head_dim]
         self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
             gather_output=False,
+            # 匿名函数: 接受一个输入 x，并返回这个输入本身
             init_method=lambda x: x,
         )
         self.wk = ColumnParallelLinear(
@@ -225,6 +230,7 @@ class Attention(nn.Module):
             gather_output=False,
             init_method=lambda x: x,
         )
+        # diff
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
@@ -233,6 +239,7 @@ class Attention(nn.Module):
             init_method=lambda x: x,
         )
 
+        # cache_kv: [max_batch_size, max_seq_len, n_local_kv_heads, head_dim]
         self.cache_k = torch.zeros(
             (
                 args.max_batch_size,
@@ -271,12 +278,17 @@ class Attention(nn.Module):
 
         """
         bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)  # w ???
 
+        # bsz ==> batch_size
+        # xq shape: [batch_size, seqlen, n_local_heads, head_dim]
+        # 其中 head_dim = dim // n_heads
+        #     n_local_heads = n_heads // tp_size
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
+        # rope_embeddinng
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         self.cache_k = self.cache_k.to(xq)
@@ -288,6 +300,7 @@ class Attention(nn.Module):
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
+        # GQA or MQA models
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -493,3 +506,5 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+# 在 PyTorch 中，当你调用模型实例时，实际上是隐式地调用了 forward 方法
